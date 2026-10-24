@@ -102,7 +102,7 @@ for r in range(3):                                   # 3 repeticiones de cada es
     audit(T(b1, 5.3), "minikube-user", "patch", "deployments", "tienda-web", "mypes", ["192.168.49.1"], K, DEP, imp=PAS, image="nginx:1.19")
     rid = f"e1-{r}"
     if r == 2:                                       # el entorno FALLÓ: Argo CD no corrigió -> ensayo excluido
-        run(rid, "E1_cambio_manual_drift", T(b1, 0), T(b1, 98), T(b1, 4.9), "fallido", 15, motivo="Argo CD no corrigió en 90s",
+        run(rid, "E1_cambio_manual_drift", T(b1, 0), T(b1, 98), T(b1, 4.9), "fallido", 15, analizar=False, motivo="el entorno sintético marcó la evidencia como inválida",
             cleanup_ts=T(b1, 99), truth_actor="pasante", truth_executor="pasante", truth_resource="deployment", truth_action="patch",
             truth_response="^(2..)$", truth_before=image, truth_after="nginx:1.19", truth_restaurada="", truth_origin_ip="",
             truth_ua="kubectl", truth_rule="cambio_manual|autocorreccion_drift", truth_revision=head, truth_argo_estado="OutOfSync/Healthy")

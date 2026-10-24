@@ -29,5 +29,12 @@ rules:
       - group: "apps"
         resources: ["deployments"]
     verbs: ["create", "update", "patch", "delete"]
-  # 5) Todo lo demás (incluye pods/exec): metadatos
+  # 5) Cambios del ConfigMap del laboratorio: capturar Request para conservar el valor de prueba modificado.
+  # No guardar secretos reales en ConfigMaps; este laboratorio usa solo una cadena sintética.
+  - level: Request
+    resources:
+      - group: ""
+        resources: ["configmaps"]
+    verbs: ["create", "update", "patch", "delete"]
+  # 6) Todo lo demás (incluye pods/exec): metadatos
   - level: Metadata

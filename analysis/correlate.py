@@ -1,26 +1,17 @@
-#!/usr/bin/env python3
-"""
-correlate.py - Análisis forense de metadatos de Git, Kubernetes (audit log) y Argo CD.
+"""correlate.py — Evalúa Sentinel-MYPES como un único prototipo integrado.
 
-HIPÓTESIS PRINCIPAL (H1): la correlación de metadatos de Git, Kubernetes Audit y Argo CD mejora la efectividad de la
-reconstrucción forense de incidentes frente al análisis de cada fuente por separado.
+VI sugerida: tipo de incidente controlado (E0-E5).
+VD: efectividad de la reconstrucción forense, con tres indicadores:
+  - campos de metadatos confirmados correctamente / campos esperados
+  - cobertura de preguntas (existe evidencia candidata)
+  - exactitud de respuestas (coinciden con la verdad de referencia independiente)
 
-  VI  Método de análisis de metadatos : git | audit | argocd (por separado)  vs  COMBINADO (correlación de las tres)
-  VD  Efectividad de la reconstrucción forense, con tres indicadores:
-        - campos recuperados CORRECTAMENTE (de los campos principales esperados en el escenario)
-        - cobertura de evidencias (hay evidencia candidata para la pregunta)
-        - preguntas forenses respondidas correctamente (Q1-Q5, comparadas con la verdad de referencia)
-
-Todos los métodos se evalúan sobre EXACTAMENTE los mismos incidentes y registros (comparación pareada).
-La verdad de referencia (campos truth_*, t_action) la captura lab.py a partir de lo que realmente hizo y observó,
-NO de los logs analizados. El auto-recuperado de Argo CD (selfHeal) forma parte del entorno, no es una variable.
-
-Preguntas: Q1 ¿quién y cuándo? | Q2 ¿qué recurso? | Q3 ¿versión antes/después (y restaurada)? | Q4 ¿desde qué origen? |
-Q5 ¿actividad sospechosa? (reglas simples sobre el audit log + autocorrección de Argo CD)
-Solo usa la biblioteca estándar de Python (3.8+).
+Git, Kubernetes Audit y Argo CD son fuentes complementarias que el prototipo correlaciona; este informe no compara las
+fuentes entre sí. La verdad de referencia se registra separadamente por lab.py. Solo usa la biblioteca estándar de Python.
 """
 import argparse
 import csv
+import html
 import json
 import re
 import statistics
@@ -142,14 +133,22 @@ def load_audit(path, ns):
             continue
         resource = res + (f"/{sub}" if sub else "") + (f"/{name}" if name else "") + f" (ns={rns})"
         images = find_images(a.get("requestObject")) if (res == "deployments" and verb in ("patch", "update", "create")) else []
+        config_data = {}
+        if res == "configmaps" and verb in ("patch", "update", "create"):
+            request_obj = a.get("requestObject") or {}
+            config_data = request_obj.get("data") or {}
         ips = ", ".join(a.get("sourceIPs") or [])
         origin = f"{ips} | {a.get('userAgent', '')}".strip(" |")
         code = (a.get("responseStatus") or {}).get("code", "")
         detail = f"{verb} {a.get('requestURI', '')} -> HTTP {code}"
         if images:
             detail += f" | imagen={images[0]}"
+        if config_data:
+            # Solo se capturan valores sintéticos de ConfigMaps del laboratorio, nunca Secret bodies.
+            detail += " | configmap_data=" + json.dumps(config_data, ensure_ascii=False, sort_keys=True)
         evs.append(event(parse_ts(a.get("requestReceivedTimestamp") or a.get("stageTimestamp")),
-                         "audit", actor, verb, resource, detail, origin, images=images, ips=a.get("sourceIPs") or [], code=code))
+                         "audit", actor, verb, resource, detail, origin, images=images, config_data=config_data,
+                         ips=a.get("sourceIPs") or [], code=code))
     return sorted(evs, key=lambda e: e["ts"])
 
 
@@ -281,10 +280,15 @@ def detectar(ev):
             eff = actor.split(" (vía")[0]
             if e["action"] in WRITE_VERBS and res.startswith("deployments/") and "argocd-application-controller" not in actor:
                 add(e, "cambio_manual")                     # cambio en un Deployment fuera del flujo GitOps
+            if e["action"] in WRITE_VERBS and res.startswith("configmaps/") and "argocd-application-controller" not in actor:
+                add(e, "cambio_configmap")                  # cambio de configuración fuera del flujo GitOps
             if res.startswith(("pods/exec", "pods/attach")):
                 add(e, "exec_en_pod")
             if res.startswith("secrets") and e["action"] in ("get", "list"):
-                add(e, "lectura_secreto")
+                if str(e["extra"].get("code", "")) == "403":
+                    add(e, "lectura_secreto_denegada")
+                else:
+                    add(e, "lectura_secreto")
             m, n = re.match(r"system:serviceaccount:([^:]+):", eff), re.search(r"\(ns=([^)]*)\)", res)
             if m and n and res.startswith("secrets") and m.group(1) != n.group(1):
                 add(e, "acceso_cruzado_ns")                 # una ServiceAccount lee secretos de OTRO namespace
@@ -298,6 +302,22 @@ def q5(sc, dets, t0, tol):
     ok = [d for d in dets if rx.search(d["tipo"]) and near(d, t0, max(tol, 30))]
     shown = (ok or dets)[:4]
     return answer(dets, ok, "; ".join(f"{d['tipo']} @ {fmt(d['ts'])} ({d['actor']} -> {d['resource']}) [{d['fuente']}]" for d in shown))
+
+
+def q6(sc, ev, t0, tol):
+    """Pregunta específica de E4: ¿se preservó el valor de configuración no autorizado y el estado restaurado?"""
+    if not sc.get("truth_config_changed"):
+        return None
+    candidates = [e for e in ev if e["source"] == "audit" and
+                  re.search(r"configmaps/tienda-config", e["resource"], re.I) and
+                  near(e, t0, max(tol, 30)) and e["extra"].get("config_data")]
+    changed = [e["extra"].get("config_data", {}).get("banner") for e in candidates]
+    observed_change = sc.get("truth_config_changed") in changed
+    restored = sc.get("truth_config_restored") == sc.get("truth_config_before")
+    text = (f"antes={sc.get('truth_config_before', '?')} | cambio registrado="
+            f"{sc.get('truth_config_changed') if observed_change else 'no recuperado del audit log'} | "
+            f"restaurado={sc.get('truth_config_restored', '?')}")
+    return answer(candidates, bool(candidates) and observed_change and restored, text)
 
 
 # ----------------------------------------------------------------------------- campos principales recuperados CORRECTAMENTE
@@ -320,7 +340,10 @@ def campos_eval(sc, ev, allowed, ctx):
     t0, tol = parse_ts(sc["t_action"]), sc.get("tol_s", 15)
     out = {}
     for s_ in expected_sources(sc["scenario"]):
-        d = {f: False for f in FIELDS[s_]}
+        field_names = list(FIELDS[s_])
+        if s_ == "audit" and sc.get("scenario", "").startswith("E4"):
+            field_names.append("valor_configuracion")
+        d = {f: False for f in field_names}
         evs = [e for e in ev if e["source"] == s_] if s_ in allowed else []
         if s_ == "git":
             m = [c for c in evs if near(c, t0, tol)]
@@ -336,6 +359,8 @@ def campos_eval(sc, ev, allowed, ctx):
             d["accion"] = any(re.search(sc.get("truth_action", "."), e["action"]) for e in key)
             d["recurso"] = any(res_rx.search(e["resource"]) for e in evs)
             d["respuesta"] = any(re.search(sc.get("truth_response", "^(2..|101)$"), str(e["extra"].get("code", ""))) for e in key)
+            if "valor_configuracion" in d:
+                d["valor_configuracion"] = any(e["extra"].get("config_data", {}).get("banner") == sc.get("truth_config_changed") for e in key)
         else:
             m = [e for e in evs if e["ts"] >= t0 - timedelta(seconds=2)]
             d["sincronizaciones"] = bool(m)
@@ -352,6 +377,7 @@ def evaluate(sc, events, allowed, ctx):
     q = {"Q1": q1(sc, ev, t0, tol), "Q2": q2(sc, ev, t0, tol), "Q4": q4(sc, ev, t0, tol)}
     q["Q3"] = q3(sc, ev, allowed, ctx) if sc.get("truth_before") else None
     q["Q5"] = q5(sc, detectar(ev), t0, tol) if sc.get("truth_rule") else None
+    q["Q6"] = q6(sc, ev, t0, tol) if sc.get("truth_config_changed") else None
     q = dict(sorted(q.items()))
     cd = campos_eval(sc, ev, allowed, ctx)
     total = sum(len(v) for v in cd.values())
@@ -422,11 +448,11 @@ def main():
         print("No hay ensayos en evidence/scenarios.jsonl (ejecuta: python lab.py e0 ... e3, o python lab.py experimento).")
         return
 
-    METHODS = SOURCES + ["COMBINADO"]
+    METHODS = ["SENTINEL-MYPES"]
     valid, excluded, rows, per_run, fp, last = [], [], [], {}, [], {}
     for i, sc in enumerate(runs):
         name = sc["scenario"]
-        if sc.get("resultado") != "exitoso":                      # entorno no válido: el incidente no se produjo/corrigió como se esperaba
+        if sc.get("analizar", True) is False:
             excluded.append(sc)
             continue
         start, end = parse_ts(sc["start"]), parse_ts(sc["end"])
@@ -438,14 +464,15 @@ def main():
         b = max(b, end)
         ctx = {"start": start, "a": a, "b": b, "git": git, "argo_hist": argo, "repo": args.repo, "manifest": args.manifest,
                "estado": load_snapshot(ev_dir / "argocd" / f"{sc.get('run_id')}.json")}
-        res = {m: evaluate(sc, events, set(SOURCES) if m == "COMBINADO" else {m}, ctx) for m in METHODS}
+        # La tesis evalúa el prototipo integrado como un único sistema; no compara sus fuentes por separado.
+        res = {"SENTINEL-MYPES": evaluate(sc, events, set(SOURCES), ctx)}
         win = [e for e in events if a <= e["ts"] <= b]
         if not sc.get("truth_rule"):
             fp.append(len(detectar([e for e in win if e["source"] != "git"])))
         valid.append(sc); per_run[sc["run_id"]] = res; last[name] = (sc, res, win, a, b)
         for m in METHODS:
             r = res[m]
-            rows.append([sc["run_id"], name, m] + [code(r["q"].get(q)) for q in ["Q1", "Q2", "Q3", "Q4", "Q5"]] +
+            rows.append([sc["run_id"], name, m] + [code(r["q"].get(q)) for q in ["Q1", "Q2", "Q3", "Q4", "Q5", "Q6"]] +
                         [r["campos_n"], r["campos_pct"], r["cobertura_pct"], r["exactitud_pct"]])
         with open(out / "lineas_tiempo" / f"{sc['run_id']}_{name}.csv", "w", newline="", encoding="utf-8") as f:
             w = csv.writer(f)
@@ -455,105 +482,191 @@ def main():
 
     with open(out / "ensayos.csv", "w", newline="", encoding="utf-8") as f:
         w = csv.writer(f)
-        w.writerow(["run_id", "escenario", "metodo", "Q1", "Q2", "Q3", "Q4", "Q5", "campos_correctos", "campos_correctos_pct",
+        w.writerow(["run_id", "escenario", "metodo", "Q1", "Q2", "Q3", "Q4", "Q5", "Q6", "campos_correctos", "campos_correctos_pct",
                     "cobertura_pct", "preguntas_correctas_pct"])
         w.writerows(rows)
 
-    # -------- agregados por escenario y método; y comparación pareada (mismos incidentes) COMBINADO vs MEJOR fuente individual
-    names = sorted({sc["scenario"] for sc in valid})
-    agg = {(n, m): {k: mean([per_run[sc["run_id"]][m][k] for sc in valid if sc["scenario"] == n]) for k, _ in INDICADORES}
-           for n in names for m in METHODS}
-    pair = {}
-    pair_rows = []
-    for k, label in INDICADORES:
-        mejor = peor = igual = 0
-        for sc in valid:
-            r = per_run[sc["run_id"]]
-            best_ind = max(r[m][k] for m in SOURCES)
-            d = r["COMBINADO"][k] - best_ind
-            mejor += d > 0; peor += d < 0; igual += d == 0
-            pair_rows.append([sc["run_id"], sc["scenario"], k, best_ind, r["COMBINADO"][k], d])
-        pair[k] = (mejor, igual, peor)
-    with open(out / "comparacion_pareada.csv", "w", newline="", encoding="utf-8") as f:
+    # -------- Informe integrado: qué reconstruyó el prototipo y qué quedó sin confirmar
+    valid_names = sorted({sc["scenario"] for sc in valid})
+    integrated = "SENTINEL-MYPES"
+    all_q = [q for sc in valid for q in per_run[sc["run_id"]][integrated]["q"].values() if q is not None]
+    fields_total = sum(sum(len(v) for v in per_run[sc["run_id"]][integrated]["campos"].values()) for sc in valid)
+    fields_ok = sum(sum(sum(1 for good in v.values() if good) for v in per_run[sc["run_id"]][integrated]["campos"].values()) for sc in valid)
+    question_coverage = round(100 * sum(q["covered"] for q in all_q) / len(all_q)) if all_q else 0
+    question_accuracy = round(100 * sum(q["correct"] for q in all_q) / len(all_q)) if all_q else 0
+    field_accuracy = round(100 * fields_ok / fields_total) if fields_total else 0
+
+    # Reescribir ensayos.csv como una fila por ensayo, sin comparaciones por fuente.
+    with open(out / "ensayos.csv", "w", newline="", encoding="utf-8-sig") as f:
         w = csv.writer(f)
-        w.writerow(["run_id", "escenario", "indicador", "mejor_fuente_individual", "combinado", "diferencia"])
-        w.writerows(pair_rows)
-    glob = {m: {k: mean([per_run[sc["run_id"]][m][k] for sc in valid]) for k, _ in INDICADORES} for m in METHODS}
-    qacc = {}
-    for q in ["Q1", "Q2", "Q3", "Q4", "Q5"]:
-        for m in METHODS:
-            vals = [per_run[sc["run_id"]][m]["q"][q]["correct"] for sc in valid if per_run[sc["run_id"]][m]["q"].get(q)]
-            qacc[(q, m)] = round(100 * sum(vals) / len(vals)) if vals else None
+        w.writerow(["run_id", "escenario", "resultado_entorno", "campos_correctos", "campos_correctos_pct",
+                    "cobertura_pct", "preguntas_correctas_pct"])
+        for sc in valid:
+            r = per_run[sc["run_id"]][integrated]
+            w.writerow([sc["run_id"], sc["scenario"], sc.get("resultado"), r["campos_n"], r["campos_pct"],
+                        r["cobertura_pct"], r["exactitud_pct"]])
 
-    # -------- Informe
-    R = ["# Reporte de resultados\n",
-         f"Eventos: Git={len(git)}, Kubernetes audit={len(audit)}, Argo CD={len(argo)}. Ensayos válidos analizados: {len(valid)}; "
-         f"excluidos por entorno no válido: {len(excluded)}.\n",
-         "**H1:** la correlación de metadatos de Git, Kubernetes Audit y Argo CD mejora la efectividad de la reconstrucción forense "
-         "frente al análisis de cada fuente por separado. **VI** = método de análisis; **VD** = efectividad (3 indicadores). "
-         "Todos los métodos se evalúan sobre los mismos incidentes y registros.\n",
-         "## 1. Resultado principal (todos los ensayos válidos)\n",
-         "| Método | " + " | ".join(l + " (%)" for _, l in INDICADORES) + " |", "|---|---|---|---|"]
-    for m in METHODS:
-        R.append(f"| {m} | " + " | ".join(str(glob[m][k]) for k, _ in INDICADORES) + " |")
-    R += ["\n### Comparación pareada: COMBINADO frente a la MEJOR fuente individual de cada incidente\n",
-          "| Indicador | COMBINADO mejor | Igual | COMBINADO peor |", "|---|---|---|---|"]
-    for k, l in INDICADORES:
-        R.append(f"| {l} | {pair[k][0]} | {pair[k][1]} | {pair[k][2]} |")
-    R += ["\n## 2. Por escenario\n", "| Escenario | Método | " + " | ".join(l + " (%)" for _, l in INDICADORES) + " |", "|---|---|---|---|---|"]
-    for n in names:
-        for m in METHODS:
-            R.append(f"| {n} ({sum(1 for sc in valid if sc['scenario'] == n)} ens.) | {m} | " + " | ".join(str(agg[(n, m)][k]) for k, _ in INDICADORES) + " |")
-    R += ["\n## 3. Exactitud por pregunta (dónde aporta la correlación)\n", "| Pregunta | " + " | ".join(METHODS) + " |", "|---|" + "---|" * len(METHODS)]
-    qn = {"Q1": "¿Quién y cuándo?", "Q2": "¿Qué recurso?", "Q3": "¿Versión antes/después/restaurada?", "Q4": "¿Origen?", "Q5": "¿Actividad sospechosa?"}
-    for q in ["Q1", "Q2", "Q3", "Q4", "Q5"]:
-        R.append(f"| {q} {qn[q]} | " + " | ".join(("—" if qacc[(q, m)] is None else f"{qacc[(q, m)]}%") for m in METHODS) + " |")
-    # entorno
-    e1 = [sc for sc in runs if sc["scenario"].startswith("E1")]
-    mt = [float(sc["mttr_s"]) for sc in e1 if sc.get("resultado") == "exitoso" and sc.get("mttr_s") is not None]
-    R += ["\n## 4. Verificación del entorno (no es una hipótesis)\n",
-          "Se comprueba que Argo CD con `selfHeal` corrigió cada cambio manual, para que existan metadatos de antes, durante y después. "
-          "Los ensayos en que no ocurrió se excluyen del análisis principal.\n",
-          f"- Ensayos E1: {len(e1)}; corregidos y verificados: {len(mt)}; excluidos: {len(e1) - len(mt)}."
-          + (f" Tiempo de corrección (descriptivo): media {mean(mt)} s, mediana {round(statistics.median(mt), 1)} s, rango {min(mt)}–{max(mt)} s." if mt else ""),
-          f"- Ensayos excluidos en total: {len(excluded)}" + (": " + ", ".join(f"{sc['scenario']} ({sc.get('motivo') or sc.get('resultado')})" for sc in excluded) if excluded else "."),
-          f"- Detecciones en el control E0 (no debería haber): {sum(fp)} en {len(fp)} ensayo(s)."]
-    R.append("\n## 5. Detalle del último ensayo válido de cada escenario\n")
-    for name, (sc, res, win, a, b) in sorted(last.items()):
-        comb = res["COMBINADO"]
-        R.append(f"\n### {name} (ensayo {sc['run_id']})\n")
-        R.append(f"Ventana: {fmt(a)} a {fmt(b)} UTC. Verdad de referencia: responsable≈`{sc['truth_actor']}`, recurso≈`{sc['truth_resource']}`"
-                 + (f", imagen {sc['truth_before']} → {sc['truth_after']}" if sc.get("truth_before") else "") + ".\n")
-        if name.startswith("E1"):
-            R.append("**Reconstrucción antes / durante / después (fuentes combinadas):**\n")
-            R += narrativa_e1(win, comb)
-            R.append("")
-        R.append("| Pregunta | Respuesta (COMBINADO) | Cubierta | Exacta |\n|---|---|---|---|")
-        for q, v in comb["q"].items():
-            if v:
-                R.append(f"| {q} {qn[q]} | {v['text'].replace('|', '/')} | {'Sí' if v['covered'] else 'No'} | {'Sí' if v['correct'] else 'No'} |")
-        R.append("\n| Método | " + " | ".join(q for q, v in comb["q"].items() if v) + " | Campos correctos | Cobertura | Preguntas correctas |\n|---|" +
-                 "---|" * (sum(1 for v in comb["q"].values() if v) + 3))
-        for m in METHODS:
-            r = res[m]
-            R.append(f"| {m} | " + " | ".join(code(v) for v in r["q"].values() if v) + f" | {r['campos_n']} ({r['campos_pct']}%) | {r['cobertura_pct']}% | {r['exactitud_pct']}% |")
-        det = comb["campos"]
-        R.append("\nCampos principales (COMBINADO): " + "; ".join(f"{s_}: " + ", ".join(f"{f}{'✔' if ok else '✘'}" for f, ok in d.items()) for s_, d in det.items()))
+    metadata_rows = []
+    for sc in valid:
+        r = per_run[sc["run_id"]][integrated]
+        for source_name, vals in r["campos"].items():
+            for field_name, correct in vals.items():
+                metadata_rows.append([sc["run_id"], sc["scenario"], source_name, field_name,
+                                      "RECUPERADO_CORRECTO" if correct else "NO_CONFIRMADO_CORRECTO"])
+    with open(out / "metadatos_por_ensayo.csv", "w", newline="", encoding="utf-8-sig") as f:
+        w = csv.writer(f)
+        w.writerow(["run_id", "escenario", "tipo_de_metadato", "campo", "estado"])
+        w.writerows(metadata_rows)
+
+    R = ["# Sentinel-MYPES — informe integrado de reconstrucción forense\n",
+         "Este informe evalúa Sentinel-MYPES como un único prototipo. Git, Kubernetes Audit y Argo CD son fuentes de evidencia del sistema; no se comparan como herramientas independientes.\n",
+         f"- Ensayos registrados: {len(runs)}.\n- Ensayos analizables: {len(valid)}.\n- Ensayos excluidos por criterio explícito `analizar=false`: {len(excluded)}.\n",
+         f"- Eventos cargados: Git={len(git)}, Kubernetes Audit={len(audit)}, Argo CD={len(argo)}.\n",
+         "## 1. Resultado global del prototipo\n",
+         "| Indicador | Resultado |", "|---|---:|",
+         f"| Campos confirmados correctos | {fields_ok}/{fields_total} ({field_accuracy}%) |",
+         f"| Campos no confirmados (ausentes o discrepantes) | {fields_total-fields_ok}/{fields_total} ({round(100*(fields_total-fields_ok)/fields_total) if fields_total else 0}%) |",
+         f"| Cobertura de preguntas | {question_coverage}% |",
+         f"| Preguntas respondidas correctamente | {question_accuracy}% |",
+         "\n**Interpretación:** ‘cubierta’ significa que existe evidencia candidata; ‘correcta’ significa que coincide con la verdad de referencia independiente. Un campo `NO_CONFIRMADO_CORRECTO` puede estar ausente o estar presente pero no coincidir con el valor esperado; revisa la línea de tiempo para distinguirlo.\n",
+         "## 2. Resultados por escenario\n",
+         "| Escenario | Ensayos analizables | Campos correctos | Cobertura | Preguntas correctas |", "|---|---:|---:|---:|---:|"]
+    for name in valid_names:
+        sts = [sc for sc in valid if sc["scenario"] == name]
+        runs_r = [per_run[sc["run_id"]][integrated] for sc in sts]
+        total_e = sum(sum(len(v) for v in r["campos"].values()) for r in runs_r)
+        total_ok = sum(sum(sum(1 for good in vals.values() if good) for vals in r["campos"].values()) for r in runs_r)
+        qlist = [q for r in runs_r for q in r["q"].values() if q is not None]
+        cov = round(100 * sum(q["covered"] for q in qlist) / len(qlist)) if qlist else 0
+        acc = round(100 * sum(q["correct"] for q in qlist) / len(qlist)) if qlist else 0
+        R.append(f"| {name} | {len(sts)} | {total_ok}/{total_e} ({round(100*total_ok/total_e) if total_e else 0}%) | {cov}% | {acc}% |")
+
+    R.append("\n## 3. Detalle de cada ensayo: metadatos recuperados y pendientes\n")
+    qn = {"Q1": "¿Quién y cuándo?", "Q2": "¿Qué recurso?", "Q3": "¿Qué versión antes/después/restaurada?",
+          "Q4": "¿Desde qué origen?", "Q5": "¿Qué actividad sospechosa se observó?",
+          "Q6": "¿Qué valor de configuración cambió y se restauró?"}
+    for sc in valid:
+        r = per_run[sc["run_id"]][integrated]
+        fields = [(src, field, good) for src, vals in r["campos"].items() for field, good in vals.items()]
+        good_fields = [(src, field) for src, field, good in fields if good]
+        pending_fields = [(src, field) for src, field, good in fields if not good]
+        R.append(f"\n### {sc['scenario']} — {sc['run_id']}\n")
+        R.append(f"- Resultado del escenario: **{sc.get('resultado','n/d')}**.\n- Ventana UTC: {sc.get('start')} → {sc.get('end')}.\n")
+        R.append(f"- Metadatos confirmados correctos: **{len(good_fields)}/{len(fields)}** ({r['campos_pct']}%).\n")
+        R.append(f"- Metadatos no confirmados: **{len(pending_fields)}/{len(fields)}** ({round(100*len(pending_fields)/len(fields)) if fields else 0}%).\n")
+        R.append("**Campos confirmados correctos:** " + (", ".join(f"`{src}.{field}`" for src, field in good_fields) if good_fields else "ninguno") + ".\n")
+        R.append("**Campos ausentes o no confirmados:** " + (", ".join(f"`{src}.{field}`" for src, field in pending_fields) if pending_fields else "ninguno") + ".\n")
+        R.append("| Pregunta | Respuesta reconstruida | Hay evidencia | Correcta |\n|---|---|---|---|")
+        for qname, val in r["q"].items():
+            if val is not None:
+                R.append(f"| {qname} {qn.get(qname,qname)} | {val['text'].replace('|','/')} | {'Sí' if val['covered'] else 'No'} | {'Sí' if val['correct'] else 'No'} |")
+        folder = ev_dir / "runs" / sc["run_id"]
+        R.append(f"\n**Evidencia preservada:** `{folder.as_posix()}` (si existe el paquete individual). Revisa `audit.jsonl`, `argocd-monitor.jsonl`, snapshots antes/después y `truth-reference.json`.\n")
+        if sc.get("scenario", "").startswith("E1") or sc.get("scenario", "").startswith("E4"):
+            if sc.get("mttr_s") is not None:
+                R.append(f"Tiempo descriptivo hasta restauración observada: {sc['mttr_s']} segundos. Este dato no es el indicador principal del estudio.\n")
+
+    R.append("\n## 4. Ensayos excluidos\n")
+    if excluded:
+        R.append("| Escenario | Resultado | Motivo |\n|---|---|---|")
+        for sc in excluded:
+            R.append(f"| {sc.get('scenario')} | {sc.get('resultado')} | {sc.get('motivo','verificar logs del ensayo')} |")
+    else:
+        R.append("No hubo ensayos excluidos por resultado del escenario. Esto no prueba ausencia de errores no detectados; solo indica que el criterio de aceptación del laboratorio se cumplió.\n")
+
+    R += ["\n## 5. Limitaciones de interpretación\n",
+          "- Los escenarios son simulaciones controladas en un clúster Minikube de un solo nodo; no representan todos los ataques reales ni una MYPE en producción.\n",
+          "- Kubernetes Audit permite saber qué solicitudes llegaron al API Server, su identidad y respuesta; por sí solo no observa toda la actividad interna de los contenedores.\n",
+          "- El registro de auditoría a nivel `Metadata` no almacena el contenido de los Secrets. El escenario E4 solo registra el cuerpo de un ConfigMap con datos sintéticos, nunca de un Secret real.\n",
+          "- Un incidente se analiza aunque Argo CD no logre recuperarse: el fallo de recuperación no borra su valor forense. Solo se excluyen ensayos marcados explícitamente `analizar=false` por un problema que impidió ejecutar el incidente o invalidó la evidencia.\n",
+          "- Los campos no confirmados correctos deben revisarse contra los eventos originales para decidir si faltó evidencia o si había evidencia contradictoria.\n",
+          "- El muestreo de Argo CD se realiza aproximadamente cada 0,75 s; un cambio más breve podría no aparecer en una muestra, aunque quede en los eventos de auditoría.\n"]
     (out / "reporte.md").write_text("\n".join(R) + "\n", encoding="utf-8")
-    (out / "metricas.json").write_text(json.dumps({
-        "ensayos_validos": len(valid), "ensayos_excluidos": len(excluded),
-        "global": glob, "por_escenario": {f"{n}|{m}": agg[(n, m)] for n in names for m in METHODS},
-        "pareada": {k: {"combinado_mejor": v[0], "igual": v[1], "combinado_peor": v[2]} for k, v in pair.items()},
-        "exactitud_por_pregunta": {f"{q}|{m}": v for (q, m), v in qacc.items()}}, indent=2, ensure_ascii=False), encoding="utf-8")
+    metrics = {
+        "ensayos_registrados": len(runs), "ensayos_analizables": len(valid), "ensayos_excluidos": len(excluded),
+        "prototipo_integrado": {"campos_correctos": fields_ok, "campos_no_confirmados": fields_total - fields_ok,
+                                "campos_esperados": fields_total, "campos_correctos_pct": field_accuracy,
+                                "campos_no_confirmados_pct": round(100*(fields_total-fields_ok)/fields_total) if fields_total else 0,
+                                "cobertura_pct": question_coverage,
+                                "preguntas_correctas_pct": question_accuracy,
+                                "preguntas_evaluadas": len(all_q)},
+        "por_escenario": {}
+    }
+    for name in valid_names:
+        sts = [sc for sc in valid if sc["scenario"] == name]
+        rs = [per_run[sc["run_id"]][integrated] for sc in sts]
+        qlist = [q for r in rs for q in r["q"].values() if q is not None]
+        ft = sum(sum(len(v) for v in r["campos"].values()) for r in rs)
+        fok = sum(sum(sum(1 for x in v.values() if x) for v in r["campos"].values()) for r in rs)
+        metrics["por_escenario"][name] = {
+            "ensayos_analizables": len(sts), "campos_correctos": fok, "campos_esperados": ft,
+            "campos_correctos_pct": round(100*fok/ft) if ft else 0,
+            "cobertura_pct": round(100*sum(q["covered"] for q in qlist)/len(qlist)) if qlist else 0,
+            "preguntas_correctas_pct": round(100*sum(q["correct"] for q in qlist)/len(qlist)) if qlist else 0
+        }
+    (out / "metricas.json").write_text(json.dumps(metrics, indent=2, ensure_ascii=False), encoding="utf-8")
 
-    print(f"\n== Resultado principal ({len(valid)} ensayos válidos, {len(excluded)} excluidos) ==")
-    print(f"  {'método':10s} " + " ".join(f"{l[:18]:>19s}" for _, l in INDICADORES))
-    for m in METHODS:
-        print(f"  {m:10s} " + " ".join(f"{glob[m][k]:>18}%" for k, _ in INDICADORES))
-    for k, l in INDICADORES:
-        print(f"  Pareada ({l}): COMBINADO mejor en {pair[k][0]}, igual en {pair[k][1]}, peor en {pair[k][2]}")
-    print(f"\nListo. Resultados en {out}/ (reporte.md, ensayos.csv, comparacion_pareada.csv, metricas.json, lineas_tiempo/)")
-
+    # Informe HTML autónomo: resumen visual, metadatos confirmados/pendientes y enlace al paquete de evidencia.
+    esc = html.escape
+    h = ["<!doctype html><html lang='es'><head><meta charset='utf-8'>",
+         "<meta name='viewport' content='width=device-width,initial-scale=1'>",
+         "<title>Sentinel-MYPES — informe visual</title><style>",
+         "body{font-family:Segoe UI,Arial,sans-serif;max-width:1180px;margin:28px auto;padding:0 18px;color:#1f2937;background:#f8fafc}",
+         "h1{margin-bottom:6px}p.sub{color:#64748b;margin-top:0}.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:12px;margin:20px 0}",
+         ".card{background:white;border:1px solid #e2e8f0;border-radius:12px;padding:16px}.big{font-size:28px;font-weight:700;margin:6px 0}.muted{color:#64748b;font-size:13px}",
+         "section{background:white;border:1px solid #e2e8f0;border-radius:12px;padding:18px;margin:16px 0;overflow-x:auto}",
+         "table{border-collapse:collapse;width:100%;font-size:14px}th,td{text-align:left;padding:9px;border-bottom:1px solid #e2e8f0;vertical-align:top}th{background:#f1f5f9}",
+         ".ok{color:#047857;font-weight:600}.pending{color:#b45309;font-weight:600}.pill{display:inline-block;background:#e2e8f0;border-radius:999px;padding:3px 8px;font-size:12px}",
+         ".bar{height:8px;background:#e2e8f0;border-radius:10px;overflow:hidden}.fill{height:100%;background:#0f766e}.links a{margin-right:10px}code{word-break:break-word}",
+         "@media(max-width:620px){body{margin:12px auto;padding:0 8px}.card{padding:12px}section{padding:12px}}",
+         "</style></head><body>",
+         "<h1>Sentinel-MYPES</h1><p class='sub'>Informe visual de reconstrucción forense · prototipo integrado · fuentes: Git + Kubernetes Audit + Argo CD</p>",
+         "<div class='cards'>",
+         f"<div class='card'><div class='muted'>Campos confirmados correctos</div><div class='big'>{field_accuracy}%</div><div class='muted'>{fields_ok} de {fields_total}</div><div class='bar'><div class='fill' style='width:{field_accuracy}%'></div></div></div>",
+         f"<div class='card'><div class='muted'>Campos no confirmados</div><div class='big'>{fields_total-fields_ok}</div><div class='muted'>de {fields_total} esperados</div></div>",
+         f"<div class='card'><div class='muted'>Cobertura de preguntas</div><div class='big'>{question_coverage}%</div><div class='bar'><div class='fill' style='width:{question_coverage}%'></div></div></div>",
+         f"<div class='card'><div class='muted'>Preguntas correctas</div><div class='big'>{question_accuracy}%</div><div class='bar'><div class='fill' style='width:{question_accuracy}%'></div></div></div>",
+         f"<div class='card'><div class='muted'>Ensayos</div><div class='big'>{len(valid)}</div><div class='muted'>{len(excluded)} excluidos explícitamente</div></div>",
+         "</div><section><h2>Resumen por escenario</h2><table><thead><tr><th>Escenario</th><th>Ensayos</th><th>Campos correctos</th><th>Cobertura</th><th>Preguntas correctas</th></tr></thead><tbody>"]
+    for name in valid_names:
+        sts = [sc for sc in valid if sc["scenario"] == name]
+        rs = [per_run[sc["run_id"]][integrated] for sc in sts]
+        total_e = sum(sum(len(v) for v in r["campos"].values()) for r in rs)
+        total_ok = sum(sum(sum(1 for good in vals.values() if good) for vals in r["campos"].values()) for r in rs)
+        qlist = [q for r in rs for q in r["q"].values() if q is not None]
+        cov = round(100 * sum(q["covered"] for q in qlist) / len(qlist)) if qlist else 0
+        acc = round(100 * sum(q["correct"] for q in qlist) / len(qlist)) if qlist else 0
+        pc = round(100*total_ok/total_e) if total_e else 0
+        h.append(f"<tr><td><strong>{esc(name)}</strong></td><td>{len(sts)}</td><td>{total_ok}/{total_e} ({pc}%)</td><td>{cov}%</td><td>{acc}%</td></tr>")
+    h.append("</tbody></table></section><h2>Detalle por ensayo</h2>")
+    q_names_html = {"Q1":"¿Quién y cuándo?", "Q2":"¿Qué recurso?", "Q3":"Imagen/versión antes y después", "Q4":"Origen", "Q5":"Actividad sospechosa", "Q6":"Valor de configuración y restauración"}
+    for sc in valid:
+        r = per_run[sc["run_id"]][integrated]
+        fields = [(src, fld, ok) for src, vals in r["campos"].items() for fld, ok in vals.items()]
+        n_ok = sum(1 for _, _, ok in fields if ok)
+        h.append(f"<section><h3>{esc(sc['scenario'])} <span class='pill'>{esc(sc['run_id'])}</span></h3>")
+        h.append(f"<p>Resultado del escenario: <strong>{esc(str(sc.get('resultado','n/d')))}</strong> · Metadatos correctos: <strong>{n_ok}/{len(fields)} ({r['campos_pct']}%)</strong></p>")
+        h.append("<table><thead><tr><th>Fuente/campo</th><th>Estado</th></tr></thead><tbody>")
+        for src, fld, ok in fields:
+            status = "RECUPERADO CORRECTAMENTE" if ok else "NO CONFIRMADO / AUSENTE O DISCREPANTE"
+            cl = "ok" if ok else "pending"
+            h.append(f"<tr><td><code>{esc(src)}.{esc(fld)}</code></td><td class='{cl}'>{status}</td></tr>")
+        h.append("</tbody></table><h4>Reconstrucción de preguntas</h4><table><thead><tr><th>Pregunta</th><th>Respuesta</th><th>Con evidencia</th><th>Exacta</th></tr></thead><tbody>")
+        for qname, val in r["q"].items():
+            if val is None:
+                continue
+            cl = "ok" if val["correct"] else "pending"
+            h.append(f"<tr><td>{qname} · {esc(q_names_html.get(qname,qname))}</td><td>{esc(val['text'])}</td><td>{'Sí' if val['covered'] else 'No'}</td><td class='{cl}'>{'Sí' if val['correct'] else 'No'}</td></tr>")
+        run_rel = f"../evidence/runs/{sc['run_id']}/README.md"
+        h.append(f"</tbody></table><p class='links'><a href='{esc(run_rel)}'>Abrir paquete de evidencia</a></p></section>")
+    h.append("<section><h2>Cómo interpretar</h2><p>‘No confirmado’ no significa automáticamente que el dato nunca existió: puede faltar en los registros o estar presente con un valor que no coincide con la verdad de referencia. Revisa el audit log, la línea de tiempo y los snapshots antes/después.</p><p>Argo CD visualiza principalmente el estado GitOps y la deriva de recursos. Lecturas de Secrets o intentos denegados pueden no cambiar el estado de la aplicación; quedan en Kubernetes Audit.</p></section></body></html>")
+    (out / "informe_visual.html").write_text("\n".join(h), encoding="utf-8")
+    print(f"\n== Sentinel-MYPES integrado: {len(valid)} ensayos analizables, {len(excluded)} excluidos ==")
+    print(f"  Campos confirmados correctos: {fields_ok}/{fields_total} ({field_accuracy}%)")
+    print(f"  Campos no confirmados: {fields_total-fields_ok}/{fields_total} ({round(100*(fields_total-fields_ok)/fields_total) if fields_total else 0}%)")
+    print(f"  Cobertura de preguntas: {question_coverage}%")
+    print(f"  Preguntas correctas: {question_accuracy}%")
+    print(f"Listo. Resultados: {out}/reporte.md, informe_visual.html, ensayos.csv, metadatos_por_ensayo.csv, metricas.json, lineas_tiempo/")
 
 if __name__ == "__main__":
     main()
