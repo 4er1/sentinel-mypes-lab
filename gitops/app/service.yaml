@@ -1,0 +1,10 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: tienda-web
+spec:
+  selector:
+    app: tienda-web
+  ports:
+    - port: 80
+      targetPort: 80

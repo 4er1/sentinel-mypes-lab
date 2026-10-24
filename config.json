@@ -1,0 +1,10 @@
+{
+  "repo_url": "https://github.com/4er1/sentinel-mypes-lab.git",
+  "git_branch": "main",
+  "app_name": "tienda-web",
+  "app_ns": "mypes",
+  "minikube_profile": "minikube",
+  "minikube_cpus": 2,
+  "minikube_memory_mb": 4096,
+  "timeout_recuperacion_s": 90
+}

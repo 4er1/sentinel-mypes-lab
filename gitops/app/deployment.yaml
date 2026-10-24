@@ -1,0 +1,24 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: tienda-web
+  labels:
+    app: tienda-web
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: tienda-web
+  template:
+    metadata:
+      labels:
+        app: tienda-web
+    spec:
+      containers:
+        - name: web
+          image: nginx:1.25
+          ports:
+            - containerPort: 80
+          resources:
+            requests: { cpu: 50m, memory: 32Mi }
+            limits: { cpu: 200m, memory: 128Mi }

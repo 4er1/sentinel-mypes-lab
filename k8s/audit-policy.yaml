@@ -1,0 +1,33 @@
+# Política de auditoría para el laboratorio: poco ruido, mucha evidencia útil.
+# Las reglas se evalúan en orden: gana la primera que coincide.
+apiVersion: audit.k8s.io/v1
+kind: Policy
+omitStages: ["RequestReceived"]
+rules:
+  # 1) Ruido del plano de control
+  - level: None
+    users: ["system:kube-proxy", "system:kube-controller-manager", "system:kube-scheduler"]
+  - level: None
+    userGroups: ["system:nodes"]
+  - level: None
+    nonResourceURLs: ["/healthz*", "/livez*", "/readyz*", "/version", "/openapi*"]
+  - level: None
+    resources:
+      - group: ""
+        resources: ["events"]
+  # 2) Secretos: SIEMPRE registrar (incluso lecturas), solo metadatos (nunca el contenido)
+  - level: Metadata
+    resources:
+      - group: ""
+        resources: ["secrets"]
+  # 3) Resto de lecturas: no registrar
+  - level: None
+    verbs: ["get", "list", "watch"]
+  # 4) Escrituras sobre Deployments: guardar el cuerpo de la petición (muestra qué imagen se puso)
+  - level: Request
+    resources:
+      - group: "apps"
+        resources: ["deployments"]
+    verbs: ["create", "update", "patch", "delete"]
+  # 5) Todo lo demás (incluye pods/exec): metadatos
+  - level: Metadata

@@ -1,0 +1,95 @@
+# Elementos del laboratorio que NO gestiona Argo CD (a propósito).
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: mypes
+---
+# Secreto de prueba (valores falsos)
+apiVersion: v1
+kind: Secret
+metadata:
+  name: db-credentials
+  namespace: mypes
+type: Opaque
+stringData:
+  usuario: admin
+  password: "demo-no-real"
+---
+# Usuario interno "pasante": puede tocar deployments, entrar a pods y leer secretos del namespace mypes
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: pasante
+  namespace: mypes
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: pasante-rol
+  namespace: mypes
+rules:
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    verbs: ["get", "list", "patch", "update"]
+  - apiGroups: [""]
+    resources: ["pods", "secrets"]
+    verbs: ["get", "list"]
+  - apiGroups: [""]
+    resources: ["pods/exec"]
+    verbs: ["create"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: pasante-binding
+  namespace: mypes
+subjects:
+  - kind: ServiceAccount
+    name: pasante
+    namespace: mypes
+roleRef:
+  kind: Role
+  name: pasante-rol
+  apiGroup: rbac.authorization.k8s.io
+---
+# Mala configuración A PROPÓSITO: una cuenta de servicio con permiso de leer secretos en TODO el clúster
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: app-comprometida
+  namespace: mypes
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: lector-secretos-excesivo
+rules:
+  - apiGroups: [""]
+    resources: ["secrets", "pods", "configmaps"]
+    verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: app-comprometida-binding
+subjects:
+  - kind: ServiceAccount
+    name: app-comprometida
+    namespace: mypes
+roleRef:
+  kind: ClusterRole
+  name: lector-secretos-excesivo
+  apiGroup: rbac.authorization.k8s.io
+---
+# Pod "comprometido" (simula una app vulnerable donde el atacante ya tiene ejecución de comandos)
+apiVersion: v1
+kind: Pod
+metadata:
+  name: web-comprometido
+  namespace: mypes
+spec:
+  serviceAccountName: app-comprometida
+  containers:
+    - name: app
+      image: curlimages/curl:8.5.0
+      command: ["sleep", "86400"]
