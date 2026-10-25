@@ -1,0 +1,24 @@
+apiVersion: audit.k8s.io/v1
+kind: Policy
+omitStages: ["RequestReceived"]
+rules:
+  - level: None
+    nonResourceURLs: ["/healthz*", "/livez*", "/readyz*", "/version", "/openapi*"]
+  # Secretos: solo metadatos, nunca contenido.
+  - level: Metadata
+    resources:
+      - group: ""
+        resources: ["secrets"]
+  # Cuerpo de solicitud solo de recursos inocuos y necesarios para el estudio.
+  - level: Request
+    resources:
+      - group: "rbac.authorization.k8s.io"
+        resources: ["rolebindings"]
+      - group: "batch"
+        resources: ["cronjobs"]
+      - group: ""
+        resources: ["configmaps"]
+    verbs: ["create", "update", "patch", "delete"]
+  - level: None
+    verbs: ["get", "list", "watch"]
+  - level: Metadata

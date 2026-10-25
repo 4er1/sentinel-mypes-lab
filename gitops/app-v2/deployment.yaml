@@ -1,0 +1,45 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mype-demo
+  labels:
+    app: mype-demo
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: mype-demo
+  template:
+    metadata:
+      labels:
+        app: mype-demo
+    spec:
+      automountServiceAccountToken: false
+      containers:
+        - name: web
+          image: nginxinc/nginx-unprivileged:1.26-alpine
+          ports:
+            - containerPort: 8080
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: cache
+              mountPath: /var/cache/nginx
+            - name: runtime
+              mountPath: /var/run
+            - name: temporary
+              mountPath: /tmp
+          resources:
+            requests: {cpu: 50m, memory: 32Mi}
+            limits: {cpu: 200m, memory: 128Mi}
+      volumes:
+        - name: cache
+          emptyDir: {}
+        - name: runtime
+          emptyDir: {}
+        - name: temporary
+          emptyDir: {}

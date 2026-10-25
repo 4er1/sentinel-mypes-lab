@@ -1,5 +1,7 @@
 evidence/
 resultados/
+evidence-v2/
+resultados-v2/
 __pycache__/
 
 archivo_datos/

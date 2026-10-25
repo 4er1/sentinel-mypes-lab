@@ -1,0 +1,12 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: mypes-lab
+  labels:
+    pod-security.kubernetes.io/audit: baseline
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: actor-laboratorio
+  namespace: mypes-lab
